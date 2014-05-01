@@ -1,0 +1,497 @@
+[[Категория:Mahoutsukai]]
+[[Категория:Информация]]
+Разбор движка KiriKiri2 на примере Mahoutsukai no Yoru.
+
+* Постановка задачи.
+* Xp3 архивы.
+* Шифрование.
+* Графика в формате TLG.
+
+== Постановка задачи. ==
+
+Допустим, мы ярые поклонники творчества Type-Moon и нам страть как хочется перевести её на родной язык, ну, или просто разжиться артом :) Что ж приступим.
+
+Что нам понадобится:
+# Шестнадцатеричный редактор для исследования двоичных файлов.
+# Отладчик для исследования самого движка.
+# Любимый язык программирования, чтобы воплотить полученные знания в полезных инструментах.
+
+В моём случае это HexWorkshop, OllyDbg, Delphi XE2 и С++ Builder XE2.
+
+Зачём нам С++ Builder?  Всё дело в том, что KiriKiri2 распространяется с исходными кодами на языке C++, а значит мы можешь подглядеть и позаимствовать там чего-нибудь полезного :). Сам автор, судя по всему, использует для сборки одну из более старых версий Билдера.
+
+Первым делом нужно определиться, где игра хранит всё самое ценное. Судя по размеру — это файлы с расширением .xp3. С них и начнём.
+
+== Xp3 архивы. ==
+
+Для начала погуглим не занимался ли кто-то до нас чем-то подобным. Движок весьма популярный, а творчество TM — ещё популярный, поэтому наверняка что-нибудь найдём. Так и есть, даже далеко ходить не пришлось: подробное описание архивов есть на сайте [http://honyaku-subs.ru/forums/viewtopic.php?f=17&t=120#p861 Honyaku Subs]
+
+Поэтому на методике разбора самой структуры и написанию утилиты для распаковки мы внимание заострять не будем, а сразу перейдем к анализу содержимого.
+
+Ниже представлена информация по первым двум файлам из таблицы архива:
+
+<pre>
+File #0
+Info Section
+  File name: $$$ This is a protected archive. $$$ 著作者はこのアーカイブが正規の利用方法以外の方法で展開されることを望んでいません。 $$$ This is a protected archive. $$$ 著作者はこのアーカイブが正規の利用方法以外の方法で展開されることを望んでいません。 $$$ This is a protected archive. $$$ 著作者はこのアーカイブが正規の利用方法以外の方法で展開されることを望んでいません。 $$$ Warning! Extracting this archive may infringe on author's rights. 警告 このアーカイブを展開することにより、あなたは著作者の権利を侵害するおそれがあります。.txt
+  Crypted: False {00000000}
+  Origin size: 157
+  Compressed size: 157
+Segm Section
+  Segment #0
+    Compressed: False
+    Offset: 88
+    Original size: 157
+    Compressed size: 157
+Adlr Section
+  Adler32: B1354C15
+
+File #1
+Info Section
+  File name: 00_タイトル.tlg
+  Crypted: True {80000000}
+  Origin size: 36313
+  Compressed size: 36313
+Segm Section
+  Segment #0
+    Compressed: False
+    Offset: 951
+    Original size: 36313
+    Compressed size: 36313
+Adlr Section
+  Adler32: B184A8C5
+</pre>  
+Из этого можно сделать несколько выводов:
+* Файлы могут быть очень длинными.
+* Файлы могут быть зашифрованными.
+
+Что ж поглядим, что про это есть в исходниках «Кирки». Делаем поиск по ключевому слову xp3 и находим два файла XP3Archive.cpp и XP3Archive.h. В них находим функцию TVPExtractArchive:
+
+<pre class="brush:c">
+// this routine is obsoleted because the Releaser includes over 256-characters
+// file name if the user specifies "protect over the archive" option.
+// Windows cannot handle such too long filename.
+void TVPExtractArchive(const ttstr & name, const ttstr & _destdir, bool allowextractprotected)
+{
+...
+}
+</pre>
+Коментарий нам услужливо подсказывает, что такие длинные имена используются для защиты от распаковки. Если ваша программа не проверяет допустимость имени файлов, то рано или поздно она завалится с ошибкой, т.к. Винда не может работать с такими длинными именами файлов. Как с этим бороться? Тут два варианта: проверять имена файлов перед попыткой сохранить файл, либо обрабатывать исключения и двигаться дальше. Лично я выбрал предварительную проверку с обрезкой длинных файлов до первых 32 символов.
+
+== Шифрование ==
+
+Теперь более сложный вопрос: шифрование. Надо понять где и как оно реализовано. Начнём всё с тех же исходников Кирки (она же должна расшифровывать файлы перед тем, как их использовать).
+В том же файлах видно, что при запросе какого-то файла у объекта класса tTVPXP3Archive тот передает клиенту объект класса tTVPXP3ArchiveStream, т.е. манипуляция данными архива идет через потоки. Вот и посмотрим, что интересного есть в tTVPXP3ArchiveStream. А интересен у него метод Read: 
+
+<pre class="brush:c">
+tjs_uint TJS_INTF_METHOD tTVPXP3ArchiveStream::Read(void *buffer, tjs_uint read_size)
+{
+...
+		// execute filter (for encryption method)
+		if(TVPXP3ArchiveExtractionFilter)
+		{
+			tTVPXP3ExtractionFilterInfo info(CurPos, (tjs_uint8*)buffer + write_size,
+				one_size, Owner->GetFileHash(StorageIndex));
+			TVPXP3ArchiveExtractionFilter
+				( (tTVPXP3ExtractionFilterInfo*) &info );
+		}
+...
+}
+</pre>
+
+А в нём мы видим, что для расшифровки файлов испольузется TVPXP3ArchiveExtractionFilter, которому передается структура типа tTVPXP3ExtractionFilterInfo. 
+Ищем файлы, в которых она упоминается и в папке src\plugins\win32\xp3filter\xp3dec\ находим файл main.cpp. В нём-то и описаны оба класса и для чего каждый нужен.
+
+<pre class="brush:c">
+void TVP_tTVPXP3ArchiveExtractionFilter_CONVENTION
+	TVPXP3ArchiveExtractionFilter(tTVPXP3ExtractionFilterInfo *info)
+{
+	// TVPXP3ArchiveExtractionFilter 関数は本体側から呼び出される
+	// コールバック関数です。
+	// 引数を一つ取り、それは tTVPXP3ExtractionFilterInfo 構造体へのポインタ
+	// です。
+
+	// TVPXP3ArchiveExtractionFilter は、後述の V2Link 関数内で
+	// TVPSetXP3ArchiveExtractionFilter により設定されます。
+
+	// ここでは単純に、xp3enc.dll のサンプルで作成された XP3 アーカイブを
+	// 復号すべく、データをすべて FileHash の最下位バイトで XOR
+	// することにします。
+
+	// この関数は複数のスレッドから同時に呼び出される可能性があるので
+	// 注意してください。
+
+	/*
+		tTVPXP3ExtractionFilterInfo のメンバは以下の通り
+		* SizeOfSelf        : 自分自身の構造体のサイズ
+		* Offset            : "Buffer" メンバが指し示すデータが、
+		*                   : アーカイブに格納されているそのファイルの先頭からの
+		*                   : どのオフセット位置からのものか、を表す
+		* Buffer            : データ本体
+		* BufferSize        : "Buffer" メンバの指し示すデータのサイズ(バイト単位)
+		* FileHash          : ファイルの暗号化解除状態でのファイル内容の32bitハッシュ
+	*/
+
+	// 一応構造体のサイズをチェックする
+	if(info->SizeOfSelf != sizeof(tTVPXP3ExtractionFilterInfo))
+	{
+		// 構造体のサイズが違う場合はここでエラーにした方がよい
+		TVPThrowExceptionMessage(TJS_W("Incompatible tTVPXP3ExtractionFilterInfo size"));
+			// TVPThrowExceptionMessage は例外メッセージを投げる関数
+			// この関数は戻らない ( もっと呼び出し元をさかのぼった位置で
+			// 例外が補足されるため )
+	}
+
+	// 復号
+	tjs_uint i;
+	for(i = 0; i < info->BufferSize; i++)
+		((unsigned char *)info->Buffer)[i] ^= info->FileHash;
+}
+</pre>
+
+Из всего этого можно сделать следующие выводы:
+* Декодер реализуется в виде плагина;
+* Плагин — это обычная динамическая библиотека, у которой расширение изменили на .tpm;
+* Информация для декодера хранится в структуре tTVPXP3ExtractionFilterInfo. Саму структуру можно представить следующим образом:
+
+<pre class="brush:delphi">
+type
+  TVPXP3ExtractionFilterInfo = record
+    // размер самой записи
+	SizeOfSelf: Integer;
+	// смещение внутри буфера
+	Offset: Int64;
+	// указатель на начало буфера
+	Buffer: Pointer;
+	// размер буфера
+	BufferSize: Integer;
+	// хеш файла
+	FileHash: Cardinal;
+  end;
+</pre>
+
+* Очевидно, что в оригинальном виде алгоритм шифрования так или иначе завязан на хеш-сумме файла.
+  
+В нашем случае на роль декодера идеально подходит файл cxdec.tpm из папки с новелой.
+
+Запускаем отладчик.
+Поскольку декодер засунут в библиотеку, скажем Оле, чтобы прерывала ход выполнения программы на загрузке модулей и дождемся, когда очередь дойдет до cxdec.tpm.
+ 
+http://img18.imageshack.us/img18/5466/screenshot2101201220164.png http://img100.imageshack.us/img100/3333/screenshot2101201220160.png
+
+Теперь нужно определить, где же собственно начинается расшифровка. По примеру из исходников видим, что перед расшифровкой проверяется размер структуры и если он неверный, то выбрасывается исключение. Причём текст его жестко забит в параметры. Попробуем его поискать. В окне дизасемблера выбираем поиск всех строк, на которые есть ссылки и вбиваем текст ошибки. 
+
+http://img214.imageshack.us/img214/327/screenshot2101201220210.png
+
+Оказываемся по адресу 1e004056h. 
+
+http://img221.imageshack.us/img221/1194/screenshot2101201220463d.png
+
+По видимому, это и есть TVPXP3ArchiveExtractionFilter. Ставим бряк на начало функции и жмем F9.
+Мы предполагаем, что должна выполняться проверка размера структуры. И нечто подобное мы видим по адресу 1E004036.
+<pre class="brush:asm">
+CMP DWORD PTR DS:[ESI],18
+</pre>
+Надо думать — это указатель на TVPXP3ArchiveExtractionFilter. Посмотрим, что там:
+
+А там как раз лежит 18h. Подозрительно :) Сама структура занимает как раз 24 байта (18h), что и должно храниться в SizeOfSelf. Что ещё мы можешм проверить? Пожалуй, хеш. Берём наш листинг содержимого архива и ищём там 9CD1D00E. В самом деле, такой файл есть:
+
+<pre>
+File #197
+Info Section
+  File name: config.tjs
+  Crypted: True {80000000}
+  Origin size: 44092
+  Compressed size: 11409
+Segm Section
+  Segment #0
+    Compressed: True
+    Offset: 173023910
+    Original size: 44092
+    Compressed size: 11409
+Adlr Section
+  Adler32: 9CD1D00E
+</pre>
+  
+Его имя, кстати, находится вниз по стэку. 
+
+http://img52.imageshack.us/img52/1142/screenshot2101201221032.png
+
+Будем считать, что структуру TVPXP3ArchiveExtractionFilter мы отыскали. Значит, по адресу 0018E7B0h лежит указатель на буфер с самим файлом 0018EA0A. Для проверки можно сравнить содержимое той области памяти с содержимым файла.
+
+Смотрим, что у нас твориться дальше. А дальше у нас либо прыжок прямо к началу дешифрования, либо запись в информации в отчет для отладки (вероятно) и порождение исключения, после чего бесконечный сон. Видимо, если вызывающая сторона «проштрафилась», её надо завесить :)
+
+В саму же функцию расшифровки параметром передается указатель на структуру TVPXP3ArchiveExtractionFilter.
+
+В итоге у нас получается следующее:
+
+<pre class="brush:asm">
+1E004020   > /8B4424 04     MOV EAX,DWORD PTR SS:[ESP+4]
+1E004024   . |56            PUSH ESI
+1E004025   . |50            PUSH EAX
+1E004026   . |E8 75E7FFFF   CALL cxdec.1E0027A0
+1E00402B   . |8BC8          MOV ECX,EAX
+1E00402D   . |E8 EEE0FFFF   CALL cxdec.1E002120
+1E004032   . |8B7424 0C     MOV ESI,DWORD PTR SS:[ESP+C]
+1E004036   . |833E 18       CMP DWORD PTR DS:[ESI],18                ; сравниваем SizeOfSelf с номинальным значением
+1E004039   . |74 2A         JE SHORT cxdec.1E004065                  ; если совпадаем, то прыгаем к расшифровке,
+1E00403B   . |A1 E055031E   MOV EAX,DWORD PTR DS:[1E0355E0]
+1E004040   . |85C0          TEST EAX,EAX
+1E004042   . |75 12         JNZ SHORT cxdec.1E004056
+1E004044   . |68 DC50021E   PUSH cxdec.1E0250DC                      ;  ASCII "void ::TVPThrowExceptionMessage(const tjs_char *)"
+1E004049   . |E8 B2B20000   CALL cxdec.1E00F300                      ; запись в отчет для отладки
+1E00404E   . |83C4 04       ADD ESP,4
+1E004051   . |A3 E055031E   MOV DWORD PTR DS:[1E0355E0],EAX
+1E004056   > |68 8050021E   PUSH cxdec.1E025080                      ;  UNICODE "Incompatible tTVPXP3ExtractionFilterInfo size"
+1E00405B   . |FFD0          CALL EAX ; порождаем исключение
+1E00405D   . |6A FF         PUSH -1                                  ; /Timeout = INFINITE
+1E00405F   . |FF15 2020021E CALL DWORD PTR DS:[<&KERNEL32.Sleep>]    ; \Sleep
+1E004065   > |56            PUSH ESI                                 ; передаем параметром указатель на структуру
+1E004066   . |E8 B5DEFFFF   CALL <cxdec.DecryptData_1f20>            ;  начинаем расшифровку
+1E00406B   . |A1 3C50031E   MOV EAX,DWORD PTR DS:[1E03503C]
+1E004070   . |83C4 04       ADD ESP,4
+1E004073   . |48            DEC EAX
+1E004074   . |A3 3C50031E   MOV DWORD PTR DS:[1E03503C],EAX
+1E004079   . |5E            POP ESI
+1E00407A   . |75 1B         JNZ SHORT cxdec.1E004097
+1E00407C   . |68 7850021E   PUSH cxdec.1E025078                      ;  UNICODE "F6"
+1E004081   . |E8 1AE7FFFF   CALL cxdec.1E0027A0
+1E004086   . |8BC8          MOV ECX,EAX                              ; |
+1E004088   . |E8 03E5FFFF   CALL cxdec.1E002590                      ; \cxdec.1E002590
+1E00408D   . |C705 3C50031E>MOV DWORD PTR DS:[1E03503C],2B73
+1E004097   > |C2 0800       RETN 8
+</pre>
+
+Теперь смотрим, что за код у нас по адресу 1E001F20h. 
+
+http://img521.imageshack.us/img521/123/screenshot2101201222573.png
+
+После беглого просмотра первых строк видно, что в регистр ESI снова помещается указатель на структуру TVPXP3ArchiveExtractionFilter.
+<pre class="brush:asm">
+1E001F26  MOV ESI,DWORD PTR SS:[ESP+18]
+</pre>
+
+ESP + 18h — это фактически параметр вызывающей функции. Для наглядности следующий код на Delphi: 
+
+<pre class="brush:delphi">
+procedure Outer(var arg: Integer);
+begin
+  Inner(arg);
+end;
+
+procedure Inner(var arg: Integer);
+begin
+  // работа с arg
+end;
+</pre>
+
+Далее по регистрам раскладываются хеш и смещение в буфере, после чего хеш копируется из EBP, EDI.
+
+<pre class="brush:asm">
+1E001F2D MOV EBP,DWORD PTR DS:[ESI+14] 
+1E001F30 MOV EAX,DWORD PTR DS:[ESI+8]  
+1E001F33 MOV EDX,DWORD PTR DS:[ESI+4]  
+1E001F36 MOV EDI,EBP                   
+</pre>
+
+После чего идут некоторые вычисления с хешем.
+<pre class="brush:asm">
+1E001F38 AND EDI,161
+1E001F3E ADD EDI,5C9
+</pre>
+
+Что эквивалентно
+<pre class="brush:delphi">
+edi := (edi and $161) + $5C9;
+</pre>
+
+Далее идет пара прыжков в зависимости от результатов сравнения старшей части смещения и нуля. Подробно все эти переходы я рассматривать не буду, скажу лишь, что так или иначе они ведут к одному из трех вызовов функции cxdec.1E002010. Нас больше интересует строчка, где младшая часть смещения сравнивается с только что посчитанным от хеша значением.
+
+<pre class="brush:asm">
+1E001F4A CMP EDX,EDI
+</pre>
+
+В неё определяются куда мы попадем.
+
+Наибольший интерес здесь представляет функция cxdec.1E002010　и параметры, которые в неё передаются.
+
+Для третьего вызова они определяются строками 
+
+<pre class="brush:asm">
+1E001FAA  |.  3BD7          CMP EDX,EDI                              
+1E001FAC  |.  73 04         JNB SHORT cxdec.1E001FB2                 
+1E001FAE  |>  8BCD          MOV ECX,EBP                             
+1E001FB0  |.  EB 07         JMP SHORT cxdec.1E001FB9
+1E001FB2  |>  8BCD          MOV ECX,EBP                              
+1E001FB4  |.  C1E9 10       SHR ECX,10
+1E001FB7  |.  33CD          XOR ECX,EBP
+1E001FB9  |>  8B7E 10       MOV EDI,DWORD PTR DS:[ESI+10]            
+1E001FBC  |.  8B76 0C       MOV ESI,DWORD PTR DS:[ESI+C]             
+1E001FBF  |.  57            PUSH EDI                                
+1E001FC0  |.  56            PUSH ESI                                 
+1E001FC1  |.  50            PUSH EAX                                 
+1E001FC2  |.  52            PUSH EDX                                 
+1E001FC3  |.  51            PUSH ECX                                
+1E001FC4  |.  E8 47000000   CALL cxdec.1E002010                     
+</pre>
+
+Т.е. сначала сравнивается смещение в буфере и число посчитанное от хеша (пусть будет bound) затем, если оно больше границы в ecx принимает значение
+<pre class="brush:delphi">
+ecx := (hash shr 10h) xor hash;
+</pre>
+иначе
+<pre class="brush:delphi">
+ecx := hash;
+</pre>
+
+Далее в регистры EDI и ESI помещаются размер буфера и указатель на него.
+<pre class="brush:asm">
+1E001FB9  |> \8B7E 10       MOV EDI,DWORD PTR DS:[ESI+10]           
+1E001FBC  |.  8B76 0C       MOV ESI,DWORD PTR DS:[ESI+C]           
+</pre>
+
+После чего происходин передача параметров и вызов функции, который можно записать так:
+<pre class="brush:delphi">
+cxdec_1E002010(key, bufOffset, bufPtr, buffSize);
+</pre>
+
+При этом key — это значение посчитанное от хеша. А смещение в буфере задается 8 байтным целым.
+
+После осмотра функции cxdec.1E002010 вилим, что сначала вызывается cxdec.1E0010D0, потом идет некоторые вычисления (заранее скажу, что они определяют границы памяти над которыми будет производится расшифровка), а потом собсвенно сама расшифровка: по буферу проходятся ксором. Причем, основная часть буфера ксорится по 4 байта, а потом остаток побайтово. Это ради скорости. Это про два цикла начиная с 1E0020D5. 
+
+Есть ещё один по адресу 1E0020A6. Заранее скажу, что для всех файлов движок вызывает дешифрование два раза: первый раз передается буфера длиной 2 байта «на пробу», а потом собсвенно расшифровывается весь файл. Так вот третий вызов cxdec.1E002010 и цикл по адресу 1E0020A6 относятся к этому случаю, а два последовательных вызова cxdec.1E002010 и два цикла ксора к основной расшифровке.
+
+Разобравшись с тем, что из себя представляет последний этап дешифровки, попробуем узнать, как получается ключ для ксора. Т.е. вернемся в начало функци к вызову cxdec.1E0010D0:
+
+<pre class="brush:asm">
+1E002010  /$  8B4C24 04     MOV ECX,DWORD PTR SS:[ESP+4]    
+1E002014  |.  83EC 10       SUB ESP,10                      
+1E002017  |.  8D4424 00     LEA EAX,DWORD PTR SS:[ESP]      
+1E00201B  |.  53            PUSH EBX                        
+1E00201C  |.  55            PUSH EBP                        
+1E00201D  |.  56            PUSH ESI                        
+1E00201E  |.  57            PUSH EDI                        
+1E00201F  |.  50            PUSH EAX                        
+1E002020  |.  51            PUSH ECX                        
+1E002021  |.  8B0D C84F031E MOV ECX,DWORD PTR DS:[1E034FC8]
+1E002027  |.  E8 A4F0FFFF   CALL cxdec.1E0010D0    
+</pre>
+
+Что мы видим?
+* В ECX кладется ключ из первого параметра;
+* Выделяется 16 байт под данные (ссылка на них будет аргументом для вызываемых функций);
+* Сохраняется значение регистров;
+* Передача параметров и вызов функции.
+
+При этом Оля нам подсказывает, что параметрами передаются хеш и указатель на область стека выделенную вызывающей стороной.
+
+http://img339.imageshack.us/img339/2056/screenshot2201201211152.png
+ 
+К тому же, стоит обратить внимание, что прямо перед вызовом в ECX поместили адрес какой-то переменной/обасти памяти. Запомним его.
+
+Вот мы добарлись до cxdec.1E0010D0. Первые строки относятся к обработке исключений (поправте меня, если ошибаюсь):
+
+<pre class="brush:asm">
+1E0010D0  /$  64:A1 0000000>MOV EAX,DWORD PTR FS:[0]
+1E0010D6  |.  6A FF         PUSH -1                    
+1E0010D8  |.  68 E816021E   PUSH cxdec.1E0216E8          
+1E0010DD  |.  50            PUSH EAX                         
+1E0010DE  |.  64:8925 00000>MOV DWORD PTR FS:[0],ESP                
+</pre>
+
+К ним же относятся строки из конца функции:
+
+<pre class="brush:asm">
+1E00120B  |> \8B4C24 10     MOV ECX,DWORD PTR SS:[ESP+10]
+1E00120F  |.  5F            POP EDI
+1E001210  |.  5E            POP ESI
+1E001211  |.  5D            POP EBP
+1E001212  |.  64:890D 00000>MOV DWORD PTR FS:[0],ECX
+</pre>
+
+Видимо, всё что происходит в этой функции завернуто в try except end (try catch в С).
+
+Далее мы видим, что в регистры EBX и EBP помещаются значения из параметров функции, а в ESI из ECX то, что перед вызовом сохранила там cxdec.1E002010 (не зря запоминали):
+
+<pre class="brush:asm">
+1E0010E5  |.  53            PUSH EBX
+1E0010E6  |.  8B5C24 14     MOV EBX,DWORD PTR SS:[ESP+14]            
+1E0010EA  |.  55            PUSH EBP
+1E0010EB  |.  8B6C24 1C     MOV EBP,DWORD PTR SS:[ESP+1C]            
+1E0010EF  |.  56            PUSH ESI
+1E0010F0  |.  8BF1          MOV ESI,ECX  
+</pre>
+
+Тогда вызов функции cxdec.1E0010D0 можно описать следующим образом:
+<pre class="brush:delphi">
+cxdec.1E0010D0(key, callerLocals, someAddr);
+</pre>
+
+Потом в EDI оказывается key:
+
+<pre class="brush:asm">
+1E0010F2  |.  57            PUSH EDI
+1E0010F3  |.  8BFB          MOV EDI,EBX                       
+</pre>
+
+Потом в callerLocals[3] (пусть это пока будет массив из 4х целых чисел) помещается -1:
+
+<pre class="brush:asm">
+1E0010F5  |.  C745 0C FFFFF MOV [ARG.2],-1
+</pre>
+
+А в EAX кладется нечто из someAddr + 384h:
+
+<pre class="brush:asm">
+1E0010FC  |.  8D86 98030000 LEA EAX,DWORD PTR DS:[ESI+398]          
+</pre>
+
+Далее код вызова EnterCriticalSection перемежается с некоторыми вычислениями над key:
+
+<pre class="brush:asm">
+1E001102  |.  83E7 7F       AND EDI,7F                           
+...
+1E00110A  |.  C1EB 07       SHR EBX,7                         
+</pre>
+
+Таким образом получаем:
+<pre class="brush:delphi">
+edi := key and 7Fh;
+ebx := key shr 7h;
+</pre>
+
+В качестве указателя на структуру pCriticalSection в EnterCriticalSection передается значение EAX (см. выше).
+<pre class="brush:asm">
+1E001105  |.  50            PUSH EAX                                 ; /pCriticalSection
+</pre>
+
+После чего по адресу в стэке, где был указатель на callerLocals помещается указатель на pCriticalSection:
+<pre class="brush:asm">
+1E001106  |.  894424 28     MOV DWORD PTR SS:[ESP+28],EAX            
+</pre>
+
+Далее в EAX помещается значение из someAddr + по смещению, рассчитанному от EDI:
+<pre class="brush:asm">
+1E001113  |.  8B44BE 04     MOV EAX,DWORD PTR DS:[ESI+EDI*4+4]       
+</pre>
+
+Теперь можно считать что someAddr — это массив из 4 байтных целых, т.е.:
+<pre class="brush:delphi">
+eax := someAddr[edi + 1]; // где edi := key and 7Fh
+</pre>
+
+Далее это значение сравнивается с нулём:
+<pre class="brush:asm">
+1E001117  |.  33C9          XOR ECX,ECX
+1E001119  |.  3BC1          CMP EAX,ECX                             
+</pre>
+
+А теперь самое интересное. Если оно не равно нулю, то делается преход с следующему коду:
+<pre class="brush:asm">
+1E0011AE  |> \8B5424 24     MOV EDX,DWORD PTR SS:[ESP+24]
+1E0011B2  |.  C74424 18 FFF>MOV DWORD PTR SS:[ESP+18],-1
+1E0011BA  |.  52            PUSH EDX                                 ; /pCriticalSection
+1E0011BB  |.  FF15 1020021E CALL DWORD PTR DS:[<&KERNEL32.LeaveCriti>; \LeaveCriticalSection
+1E0011C1  |.  53            PUSH EBX
+1E0011C2  |.  FF54BE 04     CALL DWORD PTR DS:[ESI+EDI*4+4]         
+</pre>
